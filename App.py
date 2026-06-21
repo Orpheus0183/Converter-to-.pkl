@@ -1,25 +1,4 @@
-"""
-Zip/7z to PKL Converter
-========================
-Streamlit app untuk mengonversi archive (.zip / .7z) yang isinya gambar
-menjadi satu file .pkl berisi array gambar + label, siap dipakai untuk
-training model machine learning.
-
-Struktur folder yang didukung di dalam archive:
-    dataset.zip
-    ├── kucing/
-    │   ├── img1.jpg
-    │   └── img2.jpg
-    └── anjing/
-        ├── img1.jpg
-        └── img2.jpg
-
-Nama subfolder otomatis jadi label. Kalau gambar diletakkan langsung
-tanpa subfolder, dataset akan dibuat tanpa label (unlabeled).
-"""
-
 import os
-import io
 import pickle
 import zipfile
 import tempfile
@@ -110,33 +89,59 @@ def collect_samples(extract_dir: str):
     return samples
 
 
+def estimate_memory_mb(n_images: int, size, grayscale: bool) -> float:
+    """Estimasi kasar RAM (MB) yang dibutuhkan untuk menampung array hasil resize."""
+    width, height = size
+    channels = 1 if grayscale else 3
+    return (n_images * height * width * channels) / (1024 ** 2)
+
+
 def build_dataset(samples, size, grayscale):
+    """Versi hemat memori: array hasil di-preallocate sekali di awal (bukan
+    dikumpulkan ke list lalu di-stack di akhir, yang sempat menduplikasi
+    memori saat proses stacking). Gambar dibuka satu-satu lewat context
+    manager supaya buffer-nya langsung dilepas tiap iterasi, dan PIL diberi
+    hint `draft()` supaya JPEG besar di-decode langsung dalam ukuran kecil
+    (lebih hemat RAM & lebih cepat) daripada decode full-res baru di-resize.
+    """
     has_labels = any(s[1] is not None for s in samples)
     label_names = sorted({s[1] for s in samples if s[1] is not None}) if has_labels else []
     label_to_idx = {name: i for i, name in enumerate(label_names)}
 
     mode = "L" if grayscale else "RGB"
-    data, labels, filenames, errors = [], [], [], []
+    width, height = size
+    n_total = len(samples)
+    shape = (n_total, height, width) if grayscale else (n_total, height, width, 3)
+
+    data = np.zeros(shape, dtype=np.uint8)
+    labels = np.full(n_total, -1, dtype=np.int32)
+    filenames, errors = [], []
+    valid = 0
 
     progress = st.progress(0.0, text="Memproses gambar...")
-    total = len(samples)
     for i, (filepath, label, relpath) in enumerate(samples):
         try:
-            img = Image.open(filepath).convert(mode).resize(size)
-            data.append(np.array(img))
-            labels.append(label_to_idx[label] if has_labels else -1)
+            with Image.open(filepath) as img:
+                try:
+                    img.draft(mode, size)  # hint decode kecil utk JPEG, no-op utk format lain
+                except Exception:
+                    pass
+                converted = img.convert(mode).resize(size)
+                data[valid] = np.asarray(converted, dtype=np.uint8)
+            labels[valid] = label_to_idx[label] if has_labels else -1
             filenames.append(relpath)
+            valid += 1
         except (UnidentifiedImageError, OSError, ValueError) as e:
             errors.append((relpath, str(e)))
-        if total:
-            progress.progress((i + 1) / total, text=f"Memproses gambar... ({i + 1}/{total})")
+        if n_total:
+            progress.progress((i + 1) / n_total, text=f"Memproses gambar... ({i + 1}/{n_total})")
     progress.empty()
 
-    data_arr = np.stack(data) if data else np.empty((0,))
-    labels_arr = np.array(labels)
+    data = data[:valid]   # buang slot kosong kalau ada file yang gagal diproses
+    labels = labels[:valid]
     return {
-        "data": data_arr,
-        "labels": labels_arr,
+        "data": data,
+        "labels": labels,
         "label_names": label_names,
         "filenames": filenames,
         "has_labels": has_labels,
@@ -166,6 +171,17 @@ if uploaded_file is not None:
             if not samples:
                 st.error("Tidak ditemukan file gambar di dalam archive ini.")
                 st.stop()
+
+            est_mb = estimate_memory_mb(len(samples), (int(img_w), int(img_h)), color_mode == "Grayscale")
+            if est_mb > 400:
+                st.warning(
+                    f"Estimasi data hasil resize ~{est_mb:.0f} MB di memori untuk {len(samples)} gambar. "
+                    "Streamlit Cloud (terutama tier gratis) RAM-nya terbatas (umumnya sekitar 1GB), jadi "
+                    "ini berisiko bikin app crash/restart. Kalau mau lebih aman, kecilkan ukuran resize di "
+                    "sidebar dulu sebelum lanjut."
+                )
+                if not st.checkbox("Saya paham risikonya, tetap lanjutkan proses"):
+                    st.stop()
 
             result, errors = build_dataset(samples, size=(int(img_w), int(img_h)), grayscale=(color_mode == "Grayscale"))
 
@@ -217,6 +233,7 @@ if uploaded_file is not None:
                     "y_test": labels[test_idx],
                     "label_names": label_names,
                 }
+                del data, labels  # lepas array gabungan, sudah tidak dibutuhkan
             else:
                 dataset = {
                     "data": data,
